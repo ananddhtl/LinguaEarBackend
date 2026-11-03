@@ -1,21 +1,31 @@
-import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app import mailer
 from app.config import settings
 from app.db import get_db
 from app.deps import get_current_user
 from app.models import RefreshToken, User
-from app.schemas import LoginRequest, RefreshRequest, RegisterRequest, TokenResponse, UserOut
+from app.onetime import consume_token, create_token
+from app.schemas import (
+    EmailRequest,
+    LoginRequest,
+    MessageResponse,
+    RefreshRequest,
+    RegisterRequest,
+    ResetPasswordRequest,
+    TokenRequest,
+    TokenResponse,
+    UserOut,
+)
+from app.sessions import issue_tokens, revoke_all_sessions, revoke_family
 from app.security import (
-    create_access_token,
-    create_refresh_token,
     decode_token,
     hash_password,
     token_user_id,
@@ -28,40 +38,8 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 _DUMMY_HASH = hash_password("dummy-password")
 
 
-def _issue_tokens(
-    db: Session, user: User, *, remember_me: bool, family_id: uuid.UUID | None = None
-) -> TokenResponse:
-    days = settings.remember_me_days if remember_me else settings.refresh_token_days
-    expires_at = datetime.now(timezone.utc) + timedelta(days=days)
-    jti = uuid.uuid4()
-    db.add(
-        RefreshToken(
-            jti=jti,
-            family_id=family_id or uuid.uuid4(),
-            user_id=user.id,
-            remember_me=remember_me,
-            expires_at=expires_at,
-        )
-    )
-    db.commit()
-    return TokenResponse(
-        access_token=create_access_token(user),
-        refresh_token=create_refresh_token(user, jti, expires_at),
-        expires_in=settings.access_token_minutes * 60,
-    )
-
-
-def _revoke_family(db: Session, family_id: uuid.UUID) -> None:
-    db.execute(
-        update(RefreshToken)
-        .where(RefreshToken.family_id == family_id, RefreshToken.revoked_at.is_(None))
-        .values(revoked_at=datetime.now(timezone.utc))
-    )
-    db.commit()
-
-
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-def register(body: RegisterRequest, db: Session = Depends(get_db)):
+def register(body: RegisterRequest, tasks: BackgroundTasks, db: Session = Depends(get_db)):
     email = body.email.lower()
     username = body.username.lower()
     if db.scalar(select(User).where(User.email == email)):
@@ -71,7 +49,9 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
     user = User(username=username, email=email, hashed_password=hash_password(body.password))
     db.add(user)
     db.commit()
-    return _issue_tokens(db, user, remember_me=False)
+    raw = create_token(db, user, "verify_email", timedelta(hours=settings.verify_email_hours))
+    tasks.add_task(mailer.send_verification_email, user.email, raw)
+    return issue_tokens(db, user, remember_me=False)
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -80,7 +60,9 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     valid = verify_password(body.password, user.hashed_password if user else _DUMMY_HASH)
     if not user or not valid or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password")
-    return _issue_tokens(db, user, remember_me=body.remember_me)
+    if settings.require_verified_email and not user.email_verified:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Email not verified")
+    return issue_tokens(db, user, remember_me=body.remember_me)
 
 
 @router.post("/token", response_model=TokenResponse, include_in_schema=True)
@@ -108,11 +90,11 @@ def refresh(body: RefreshRequest, db: Session = Depends(get_db)):
         raise invalid
     if row.revoked_at is not None:
         # An already-rotated token was presented again: assume theft, kill the whole chain.
-        _revoke_family(db, row.family_id)
+        revoke_family(db, row.family_id)
         raise invalid
 
     row.revoked_at = datetime.now(timezone.utc)
-    return _issue_tokens(db, user, remember_me=row.remember_me, family_id=row.family_id)
+    return issue_tokens(db, user, remember_me=row.remember_me, family_id=row.family_id)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -125,23 +107,64 @@ def logout(body: RefreshRequest, db: Session = Depends(get_db)):
     except (jwt.PyJWTError, KeyError, ValueError, AttributeError):
         row = None
     if row:
-        _revoke_family(db, row.family_id)
+        revoke_family(db, row.family_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/logout-all", status_code=status.HTTP_204_NO_CONTENT)
 def logout_all(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Signs the user out everywhere: rotating their secret invalidates all their tokens at once."""
-    user.token_secret = secrets.token_hex(32)
-    db.execute(
-        update(RefreshToken)
-        .where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
-        .values(revoked_at=datetime.now(timezone.utc))
-    )
-    db.commit()
+    """Signs the user out everywhere."""
+    revoke_all_sessions(db, user)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)):
     return user
+
+
+@router.post("/verify-email", response_model=MessageResponse)
+def verify_email(body: TokenRequest, db: Session = Depends(get_db)):
+    """Confirms the address from the registration email, or a new address from an email change."""
+    row = consume_token(db, "verify_email", body.token) or consume_token(db, "change_email", body.token)
+    if row is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired token")
+    user = db.get(User, row.user_id)
+    if row.new_email:
+        if db.scalar(select(User).where(User.email == row.new_email, User.id != user.id)):
+            raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
+        user.email = row.new_email
+    user.email_verified = True
+    db.commit()
+    return MessageResponse(message="Email verified")
+
+
+@router.post("/resend-verification", response_model=MessageResponse, status_code=status.HTTP_202_ACCEPTED)
+def resend_verification(body: EmailRequest, tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """Always answers the same way so it can't be used to discover which emails are registered."""
+    user = db.scalar(select(User).where(User.email == body.email.lower()))
+    if user and user.is_active and not user.email_verified:
+        raw = create_token(db, user, "verify_email", timedelta(hours=settings.verify_email_hours))
+        tasks.add_task(mailer.send_verification_email, user.email, raw)
+    return MessageResponse(message="If that account needs verification, an email has been sent")
+
+
+@router.post("/forgot-password", response_model=MessageResponse, status_code=status.HTTP_202_ACCEPTED)
+def forgot_password(body: EmailRequest, tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.email == body.email.lower()))
+    if user and user.is_active:
+        raw = create_token(db, user, "reset_password", timedelta(minutes=settings.reset_password_minutes))
+        tasks.add_task(mailer.send_password_reset_email, user.email, raw)
+    return MessageResponse(message="If that email is registered, a reset link has been sent")
+
+
+@router.post("/reset-password", response_model=MessageResponse)
+def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
+    row = consume_token(db, "reset_password", body.token)
+    if row is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired token")
+    user = db.get(User, row.user_id)
+    user.hashed_password = hash_password(body.new_password)
+    user.email_verified = True  # they just proved they control the inbox
+    revoke_all_sessions(db, user)  # commits; every existing session is signed out
+    return MessageResponse(message="Password updated. Please log in again.")
