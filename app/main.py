@@ -3,7 +3,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.routers import auth, users
+from app.routers import ai, analyses, auth, billing, notifications, scores, support, users
 
 app = FastAPI(
     title="LinguaEar API",
@@ -16,10 +16,22 @@ app = FastAPI(
     openapi_tags=[
         {"name": "auth", "description": "Register, log in, refresh, verify email, reset password."},
         {"name": "profile", "description": "View and update the signed-in user's profile and password."},
+        {"name": "support", "description": "Help requests (tickets) from users."},
+        {"name": "notifications", "description": "Optional email preferences and unsubscribe links."},
+        {"name": "billing", "description": "Free trial, plans and Stripe checkout."},
+        {"name": "ai", "description": "AI features (speech to text, tutor, game, camera) with daily per-user limits."},
+        {"name": "scores", "description": "Points, level and streak for the signed-in user."},
+        {"name": "analyses", "description": "Save, list and delete the signed-in user's tutor results."},
     ],
 )
 app.include_router(auth.router)
 app.include_router(users.router)
+app.include_router(analyses.router)
+app.include_router(scores.router)
+app.include_router(ai.router)
+app.include_router(billing.router)
+app.include_router(support.router)
+app.include_router(notifications.router)
 
 
 @app.get("/health")

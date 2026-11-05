@@ -1,8 +1,9 @@
 import secrets
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -25,6 +26,9 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    # End of the free trial; after this, access needs a subscription.
+    trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
 
 
 class OneTimeToken(Base):
@@ -42,6 +46,7 @@ class OneTimeToken(Base):
     new_email: Mapped[str | None] = mapped_column(String(320))  # only for change_email
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")  # wrong guesses (codes)
 
 
 class RefreshToken(Base):
@@ -60,3 +65,106 @@ class RefreshToken(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Analysis(Base):
+    """A saved tutor result for one spoken phrase. Text only: audio is never stored."""
+
+    __tablename__ = "analyses"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    transcript: Mapped[str] = mapped_column(Text)
+    # Where the phrase came from: spoken into the mic or read from the camera.
+    source: Mapped[str] = mapped_column(String(10), default="speech", server_default="speech")
+    translation: Mapped[str] = mapped_column(Text, default="", server_default="")  # camera scans
+    explanation: Mapped[str] = mapped_column(Text, default="")
+    tone: Mapped[str] = mapped_column(String(100), default="")
+    grammar: Mapped[str] = mapped_column(Text, default="")
+    quiz: Mapped[str] = mapped_column(Text, default="")
+    articles: Mapped[list] = mapped_column(JSONB, default=list)  # [{word, gender}]
+    compounds: Mapped[list] = mapped_column(JSONB, default=list)  # [{word, parts:[{text, meaning}], meaning}]
+    # [{question, options, answer_index, explanation}]; `quiz` above is the older free-text form.
+    quiz_questions: Mapped[list] = mapped_column(JSONB, default=list, server_default=text("'[]'::jsonb"))
+    # Latest quiz result for this phrase; both are null until the quiz has been finished.
+    quiz_score: Mapped[int | None] = mapped_column(Integer)
+    quiz_total: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class ScoreEvent(Base):
+    """Append-only ledger of points a user earned; totals are summed from it."""
+
+    __tablename__ = "score_events"
+    __table_args__ = (
+        # A saved phrase's quiz pays out once, so retaking it can't be farmed.
+        UniqueConstraint("user_id", "kind", "ref_id", name="uq_score_event_ref"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(10))  # quiz | game
+    points: Mapped[int] = mapped_column(Integer)
+    ref_id: Mapped[int | None] = mapped_column(Integer)  # analysis id for quiz events
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class UsageCount(Base):
+    """How many times a user has called one AI feature on one (UTC) day."""
+
+    __tablename__ = "usage_counts"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(12), primary_key=True)  # analyze | game | scan | transcribe
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class Subscription(Base):
+    """A user's Stripe subscription, kept in step by webhooks. One row per user."""
+
+    __tablename__ = "subscriptions"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    stripe_subscription_id: Mapped[str] = mapped_column(String(64), unique=True)
+    tier: Mapped[str] = mapped_column(String(10))  # standard | pro
+    status: Mapped[str] = mapped_column(String(20))  # Stripe status: active, trialing, past_due, canceled, ...
+    current_period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SupportTicket(Base):
+    """A help request from a user. Replies go out by email, so a ticket only tracks its own status."""
+
+    __tablename__ = "support_tickets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    category: Mapped[str] = mapped_column(String(12))  # bug | account | billing | feature | other
+    subject: Mapped[str] = mapped_column(String(120))
+    message: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(10), default="open", server_default="open")  # open | closed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class NotificationPreference(Base):
+    """Which optional emails a user wants. Security emails (codes, password resets) are always sent."""
+
+    __tablename__ = "notification_preferences"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    # Reminders and updates are opt-in; billing emails are about the user's own subscription.
+    practice_reminders: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    product_updates: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    billing_emails: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    last_reminder_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

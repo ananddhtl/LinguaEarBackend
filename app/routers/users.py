@@ -4,13 +4,15 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import mailer
+from app import codes, mailer, stripe_service
 from app.config import settings
 from app.db import get_db
 from app.deps import get_current_user
 from app.models import User
 from app.onetime import create_token
 from app.schemas import (
+    CodeSent,
+    VerifyCodeRequest,
     ChangePasswordRequest,
     DeleteAccountRequest,
     ProfileUpdate,
@@ -63,6 +65,47 @@ def update_profile(
     return user
 
 
+@router.post("/me/verification-code", response_model=CodeSent)
+def send_verification_code(
+    tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Emails a fresh 6-digit code. Asking again within a minute returns the wait instead of sending."""
+    if user.email_verified:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Your email is already verified.")
+    code, wait = codes.issue_code(db, user, codes.VERIFY)
+    if code is None:
+        return CodeSent(sent=False, retry_after=wait)
+    tasks.add_task(mailer.send_verification_code_email, user.email, code)
+    return CodeSent(sent=True, retry_after=settings.verification_resend_seconds)
+
+
+@router.post("/me/verify-email", response_model=UserOut)
+def verify_email_code(
+    body: VerifyCodeRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if user.email_verified:
+        return user
+    result, left = codes.check_code(db, user, body.code, codes.VERIFY)
+    if result == "ok":
+        user.email_verified = True
+        db.commit()
+    else:
+        messages = {
+            "wrong": f"That code is not right. {left} tr{'y' if left == 1 else 'ies'} left.",
+            "expired": "That code has expired. Request a new one.",
+            "locked": "Too many wrong codes. Request a new one.",
+        }
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, {"code": result, "message": messages[result], "attempts_left": left}
+        )
+    db.refresh(user)
+    return user
+
+
 @router.post("/me/change-password", response_model=TokenResponse)
 def change_password(
     body: ChangePasswordRequest,
@@ -85,6 +128,7 @@ def delete_account(
 ):
     if not verify_password(body.password, user.hashed_password):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Password is incorrect")
+    stripe_service.cancel_subscription_for_deletion(db, user)
     db.delete(user)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

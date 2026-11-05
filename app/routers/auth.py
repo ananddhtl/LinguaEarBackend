@@ -7,7 +7,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import mailer
+from app import codes, mailer
 from app.config import settings
 from app.db import get_db
 from app.deps import get_current_user
@@ -46,11 +46,16 @@ def register(body: RegisterRequest, tasks: BackgroundTasks, db: Session = Depend
         raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
     if db.scalar(select(User).where(User.username == username)):
         raise HTTPException(status.HTTP_409_CONFLICT, "Username already taken")
-    user = User(username=username, email=email, hashed_password=hash_password(body.password))
+    user = User(
+        username=username,
+        email=email,
+        hashed_password=hash_password(body.password),
+        trial_ends_at=datetime.now(timezone.utc) + timedelta(days=settings.trial_days),
+    )
     db.add(user)
     db.commit()
-    raw = create_token(db, user, "verify_email", timedelta(hours=settings.verify_email_hours))
-    tasks.add_task(mailer.send_verification_email, user.email, raw)
+    code, _ = codes.issue_code(db, user, codes.VERIFY)
+    tasks.add_task(mailer.send_verification_code_email, user.email, code)
     return issue_tokens(db, user, remember_me=False)
 
 
@@ -151,20 +156,32 @@ def resend_verification(body: EmailRequest, tasks: BackgroundTasks, db: Session 
 
 @router.post("/forgot-password", response_model=MessageResponse, status_code=status.HTTP_202_ACCEPTED)
 def forgot_password(body: EmailRequest, tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """Emails a 6-digit reset code. The answer is the same whether or not the email is registered."""
     user = db.scalar(select(User).where(User.email == body.email.lower()))
     if user and user.is_active:
-        raw = create_token(db, user, "reset_password", timedelta(minutes=settings.reset_password_minutes))
-        tasks.add_task(mailer.send_password_reset_email, user.email, raw)
-    return MessageResponse(message="If that email is registered, a reset link has been sent")
+        code, _ = codes.issue_code(db, user, codes.RESET)  # None while the last code is still fresh
+        if code:
+            tasks.add_task(mailer.send_password_reset_code_email, user.email, code)
+    return MessageResponse(message="If that email is registered, a code has been sent")
 
 
 @router.post("/reset-password", response_model=MessageResponse)
 def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)):
-    row = consume_token(db, "reset_password", body.token)
-    if row is None:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired token")
-    user = db.get(User, row.user_id)
+    """Sets a new password using the emailed code, and signs the account out everywhere."""
+    user = db.scalar(select(User).where(User.email == body.email.lower()))
+    # One answer for every failure (unknown email, wrong, expired or locked code), so this endpoint
+    # can't be used to find out which emails have accounts.
+    invalid = HTTPException(
+        status.HTTP_400_BAD_REQUEST,
+        {"code": "invalid", "message": "That code is not right or has expired. Request a new one."},
+    )
+    if user is None or not user.is_active:
+        raise invalid
+    result, _ = codes.check_code(db, user, body.code, codes.RESET)
+    if result != "ok":
+        raise invalid
+
     user.hashed_password = hash_password(body.new_password)
     user.email_verified = True  # they just proved they control the inbox
     revoke_all_sessions(db, user)  # commits; every existing session is signed out
-    return MessageResponse(message="Password updated. Please log in again.")
+    return MessageResponse(message="Password updated. Please log in with your new password.")
