@@ -3,7 +3,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.routers import ai, analyses, auth, billing, notifications, scores, support, users
+from app.routers import ai, analyses, auth, billing, diagnostics, notifications, scores, support, users
 
 app = FastAPI(
     title="LinguaEar API",
@@ -29,6 +29,7 @@ app.include_router(users.router)
 app.include_router(analyses.router)
 app.include_router(scores.router)
 app.include_router(ai.router)
+app.include_router(diagnostics.router)
 app.include_router(billing.router)
 app.include_router(support.router)
 app.include_router(notifications.router)

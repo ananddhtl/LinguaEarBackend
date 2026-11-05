@@ -1,15 +1,55 @@
 import logging
 import smtplib
 from email.message import EmailMessage
+from email.utils import parseaddr
+
+import httpx
 
 from app.config import settings
 
 log = logging.getLogger("uvicorn.error")
 
 
+BREVO_URL = "https://api.brevo.com/v3/smtp/email"
+
+
+def _send_with_brevo(to: str, subject: str, body: str, reply_to: str | None) -> None:
+    """Sends through Brevo's web API. Raises with Brevo's own explanation if it refuses."""
+    name, address = parseaddr(settings.smtp_from)
+    payload = {
+        "sender": {"email": address, **({"name": name} if name else {})},
+        "to": [{"email": to}],
+        "subject": subject,
+        "textContent": body,
+    }
+    if reply_to:
+        payload["replyTo"] = {"email": reply_to}
+    response = httpx.post(
+        BREVO_URL,
+        json=payload,
+        headers={"api-key": settings.brevo_api_key or "", "accept": "application/json"},
+        timeout=20,
+    )
+    if response.status_code >= 300:
+        # Brevo's answer says exactly what is wrong (unknown sender, bad key, account not activated...).
+        raise RuntimeError(f"Brevo answered {response.status_code}: {response.text[:300]}")
+
+
 def send_email(to: str, subject: str, body: str, reply_to: str | None = None) -> None:
     if settings.log_email_bodies:
         log.warning("[dev] email to %s\nSubject: %s\n%s", to, subject, body)
+    if settings.brevo_api_key:
+        # Runs in a background task; one retry catches a one-off network hiccup.
+        for attempt in (1, 2):
+            try:
+                _send_with_brevo(to, subject, body, reply_to)
+                return
+            except Exception:
+                if attempt == 2:
+                    log.exception("Failed to send email to %s through the Brevo API", to)
+                else:
+                    log.warning("Sending email to %s through the Brevo API failed, retrying once", to)
+        return
     if not settings.smtp_host:
         log.warning("SMTP not configured - email to %s not sent:\nSubject: %s\n%s", to, subject, body)
         return

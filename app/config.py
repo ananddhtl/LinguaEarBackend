@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     max_image_chars: int = 1_500_000  # base64 length of a scan photo
     max_output_tokens: int = 1500
 
+    # Brevo's web API sends mail over HTTPS, which hosts that block SMTP ports still allow. It wins over SMTP when set.
+    brevo_api_key: str | None = None
+
+    # Set this to a long random value to switch on GET /health/email, which tests the mail connection.
+    diagnostics_token: str | None = None
+
     # Support. Tickets are emailed here; with no address set, the SMTP account's own inbox is used.
     support_email: str | None = None
     max_tickets_per_day: int = 5
