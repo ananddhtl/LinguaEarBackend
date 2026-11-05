@@ -17,6 +17,7 @@ from app.routers import (
     analyses,
     auth,
     billing,
+    content,
     diagnostics,
     notifications,
     scenarios,
@@ -73,6 +74,8 @@ app.include_router(diagnostics.router)
 app.include_router(scenarios.router)
 app.include_router(admin.router)
 app.include_router(admin_manage.router)
+app.include_router(content.public)
+app.include_router(content.admin)
 app.include_router(billing.router)
 app.include_router(support.router)
 app.include_router(notifications.router)

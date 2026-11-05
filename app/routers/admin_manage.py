@@ -7,8 +7,10 @@ from sqlalchemy.orm import Session
 from app import limits, mailer
 from app.billing import ACCESS_STATUSES, current_plan, status_for
 from app.db import get_db
+from app.config import settings
 from app.models import (
     Analysis,
+    RefreshToken,
     Scenario,
     ScenarioRequest,
     ScoreEvent,
@@ -20,6 +22,7 @@ from app.models import (
 )
 from app.routers.admin import require_admin
 from app.schemas import (
+    AdminHistoryPage,
     AdminTicketDetail,
     AdminTicketOut,
     AdminUserDetail,
@@ -100,8 +103,70 @@ def stats(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
 # ---- Users ----
 
 
-def _user_out(db: Session, user: User) -> dict:
-    return {**AdminUserOut.model_validate(user).model_dump(), "plan": current_plan(db, user)}
+def _account_type(user: User, plan: str | None, subscribed: bool) -> str:
+    if user.is_admin:
+        return "admin"
+    if subscribed and plan:
+        return plan
+    return "trial" if plan else "expired"
+
+
+def _users_out(db: Session, users: list[User]) -> list[dict]:
+    """Profile, plan and activity numbers for a page of users, with one query per number rather than per user."""
+    if not users:
+        return []
+    ids = [u.id for u in users]
+    today = limits._today()
+
+    def per_user(query) -> dict:
+        return {uid: value for uid, value in db.execute(query)}
+
+    points = per_user(
+        select(ScoreEvent.user_id, func.sum(ScoreEvent.points)).where(ScoreEvent.user_id.in_(ids)).group_by(ScoreEvent.user_id)
+    )
+    saved = per_user(
+        select(Analysis.user_id, func.count(Analysis.id)).where(Analysis.user_id.in_(ids)).group_by(Analysis.user_id)
+    )
+    calls_7d = per_user(
+        select(UsageCount.user_id, func.sum(UsageCount.count))
+        .where(UsageCount.user_id.in_(ids), UsageCount.day >= today - timedelta(days=6))
+        .group_by(UsageCount.user_id)
+    )
+    calls_today = per_user(
+        select(UsageCount.user_id, func.sum(UsageCount.count))
+        .where(UsageCount.user_id.in_(ids), UsageCount.day == today)
+        .group_by(UsageCount.user_id)
+    )
+    last_seen = per_user(
+        select(RefreshToken.user_id, func.max(RefreshToken.created_at))
+        .where(RefreshToken.user_id.in_(ids))
+        .group_by(RefreshToken.user_id)
+    )
+    subscribed = {
+        uid
+        for (uid,) in db.execute(
+            select(Subscription.user_id).where(Subscription.user_id.in_(ids), Subscription.status.in_(ACCESS_STATUSES))
+        )
+    }
+
+    rows = []
+    for u in users:
+        plan = current_plan(db, u)
+        total = int(points.get(u.id) or 0)
+        rows.append(
+            {
+                **AdminUserOut.model_validate(u).model_dump(),
+                "plan": plan,
+                "account_type": _account_type(u, plan, u.id in subscribed),
+                "points": total,
+                "level": total // settings.points_per_level + 1,
+                "saved_phrases": int(saved.get(u.id) or 0),
+                "calls_today": int(calls_today.get(u.id) or 0),
+                "calls_7d": int(calls_7d.get(u.id) or 0),
+                "last_active": last_seen.get(u.id),
+            }
+        )
+    return rows
 
 
 def _user(db: Session, user_id: int) -> User:
@@ -114,6 +179,7 @@ def _user(db: Session, user_id: int) -> User:
 @router.get("/users", response_model=AdminUserList)
 def list_users(
     q: str | None = Query(default=None, max_length=100),
+    kind: str | None = Query(default=None, pattern="^(admin|pro|standard|trial|expired|disabled)$"),
     limit: int = Query(default=30, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     admin: User = Depends(require_admin),
@@ -123,22 +189,62 @@ def list_users(
     if q:
         like = f"%{q.strip()}%"
         query = query.where(or_(User.email.ilike(like), User.username.ilike(like), User.full_name.ilike(like)))
+    if kind == "disabled":
+        query = query.where(User.is_active.is_(False))
+    elif kind == "admin":
+        query = query.where(User.is_admin)
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    if kind in ("pro", "standard", "trial", "expired"):
+        # The plan is worked out from billing rules, so these filters run over the matches in Python.
+        everyone = _users_out(db, db.scalars(query.order_by(User.id.desc())).all())
+        matches = [r for r in everyone if r["account_type"] == kind]
+        return {"total": len(matches), "users": matches[offset : offset + limit]}
     rows = db.scalars(query.order_by(User.id.desc()).limit(limit).offset(offset)).all()
-    return {"total": total, "users": [_user_out(db, u) for u in rows]}
+    return {"total": total, "users": _users_out(db, rows)}
 
 
 @router.get("/users/{user_id}", response_model=AdminUserDetail)
 def get_user(user_id: int, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     user = _user(db, user_id)
+    today = limits._today()
+    per_day = {
+        str(day): int(n or 0)
+        for day, n in db.execute(
+            select(UsageCount.day, func.sum(UsageCount.count))
+            .where(UsageCount.user_id == user.id, UsageCount.day >= today - timedelta(days=13))
+            .group_by(UsageCount.day)
+        )
+    }
+    scores = db.scalars(
+        select(ScoreEvent).where(ScoreEvent.user_id == user.id).order_by(ScoreEvent.id.desc()).limit(10)
+    ).all()
     return {
-        **_user_out(db, user),
+        **_users_out(db, [user])[0],
         "billing": status_for(db, user),
         "usage": limits.usage_summary(db, user),
-        "points": db.scalar(select(func.coalesce(func.sum(ScoreEvent.points), 0)).where(ScoreEvent.user_id == user.id)),
-        "saved_phrases": db.scalar(select(func.count(Analysis.id)).where(Analysis.user_id == user.id)) or 0,
         "tickets": db.scalar(select(func.count(SupportTicket.id)).where(SupportTicket.user_id == user.id)) or 0,
+        "daily_usage": [
+            {"day": str(today - timedelta(days=i)), "calls": per_day.get(str(today - timedelta(days=i)), 0)}
+            for i in range(13, -1, -1)
+        ],
+        "recent_scores": [{"kind": e.kind, "points": e.points, "created_at": e.created_at} for e in scores],
     }
+
+
+@router.get("/users/{user_id}/history", response_model=AdminHistoryPage)
+def user_history(
+    user_id: int,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """The phrases and scans this user chose to save. Prompts they did not save are never stored."""
+    _user(db, user_id)
+    where = Analysis.user_id == user_id
+    total = db.scalar(select(func.count(Analysis.id)).where(where)) or 0
+    items = db.scalars(select(Analysis).where(where).order_by(Analysis.id.desc()).limit(limit).offset(offset)).all()
+    return {"total": total, "items": items}
 
 
 @router.patch("/users/{user_id}", response_model=AdminUserOut)
@@ -161,7 +267,7 @@ def update_user(
         user.token_secret = secrets.token_hex(32)  # signs them out of every device at once
     db.commit()
     db.refresh(user)
-    return _user_out(db, user)
+    return _users_out(db, [user])[0]
 
 
 # ---- Support tickets ----

@@ -159,6 +159,19 @@ class SupportTicket(Base):
     )
 
 
+class ContentBlock(Base):
+    """Editable website text (home page, pricing, legal pages), kept as JSON. A missing row means "use the default"."""
+
+    __tablename__ = "content_blocks"
+
+    key: Mapped[str] = mapped_column(String(30), primary_key=True)
+    data: Mapped[dict] = mapped_column(JSONB)
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class TicketReply(Base):
     """An answer from support. It is emailed to the user and kept here so the thread can be read later."""
 

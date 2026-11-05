@@ -392,6 +392,13 @@ class AdminUserOut(BaseModel):
     created_at: datetime
     trial_ends_at: datetime | None
     plan: str | None = None  # standard | pro while they have access, otherwise null
+    account_type: str = "free"  # admin | pro | standard | trial | expired
+    points: int = 0
+    level: int = 1
+    saved_phrases: int = 0
+    calls_today: int = 0
+    calls_7d: int = 0
+    last_active: datetime | None = None
 
 
 class AdminUserList(BaseModel):
@@ -399,12 +406,23 @@ class AdminUserList(BaseModel):
     users: list[AdminUserOut]
 
 
+class DayUsage(BaseModel):
+    day: str
+    calls: int
+
+
+class ScorePoint(BaseModel):
+    kind: str
+    points: int
+    created_at: datetime
+
+
 class AdminUserDetail(AdminUserOut):
     billing: dict
     usage: dict
-    points: int
-    saved_phrases: int
     tickets: int
+    daily_usage: list[DayUsage]
+    recent_scores: list[ScorePoint]
 
 
 class AdminUserPatch(BaseModel):
@@ -439,3 +457,84 @@ class TicketStatusPatch(BaseModel):
 
 class TicketReplyIn(BaseModel):
     message: str = Field(min_length=2, max_length=5000)
+
+
+# ---- Admin: website content ----
+
+
+class Feature(BaseModel):
+    title: str = Field(min_length=1, max_length=80)
+    text: str = Field(min_length=1, max_length=400)
+
+
+class LevelBlurb(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    cefr: str = Field(max_length=20)
+    text: str = Field(min_length=1, max_length=300)
+
+
+class HomeContent(BaseModel):
+    headline: str = Field(min_length=1, max_length=120)
+    intro: str = Field(min_length=1, max_length=500)
+    features: list[Feature] = Field(max_length=12)
+    levels: list[LevelBlurb] = Field(max_length=6)
+
+
+class PlanBlurb(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    price: str = Field(min_length=1, max_length=30)
+    blurb: str = Field(max_length=200)
+    items: list[str] = Field(max_length=12)
+
+
+class Faq(BaseModel):
+    q: str = Field(min_length=1, max_length=200)
+    a: str = Field(min_length=1, max_length=600)
+
+
+class PricingContent(BaseModel):
+    intro: str = Field(max_length=300)
+    plans: list[PlanBlurb] = Field(max_length=4)
+    faq: list[Faq] = Field(max_length=12)
+
+
+class LegalSectionContent(BaseModel):
+    heading: str = Field(min_length=1, max_length=160)
+    paragraphs: list[str] = Field(max_length=30)
+    bullets: list[str] | None = Field(default=None, max_length=40)
+
+
+class LegalContent(BaseModel):
+    title: str = Field(min_length=1, max_length=80)
+    updated: str = Field(max_length=40)
+    intro: str = Field(max_length=1000)
+    sections: list[LegalSectionContent] = Field(max_length=40)
+
+
+CONTENT_MODELS = {
+    "home": HomeContent,
+    "pricing": PricingContent,
+    "terms": LegalContent,
+    "privacy": LegalContent,
+    "impressum": LegalContent,
+}
+
+
+class AdminHistoryItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    source: str
+    transcript: str
+    translation: str
+    explanation: str
+    tone: str
+    grammar: str
+    quiz_score: int | None
+    quiz_total: int | None
+    created_at: datetime
+
+
+class AdminHistoryPage(BaseModel):
+    total: int
+    items: list[AdminHistoryItem]
