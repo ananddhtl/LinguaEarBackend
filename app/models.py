@@ -29,6 +29,8 @@ class User(Base):
     # End of the free trial; after this, access needs a subscription.
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     stripe_customer_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    # Can use the /admin endpoints (the future admin panel). Set it by hand: UPDATE users SET is_admin = true ...
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
 
 
 class OneTimeToken(Base):
@@ -157,6 +159,18 @@ class SupportTicket(Base):
     )
 
 
+class TicketReply(Base):
+    """An answer from support. It is emailed to the user and kept here so the thread can be read later."""
+
+    __tablename__ = "ticket_replies"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("support_tickets.id", ondelete="CASCADE"), index=True)
+    admin_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    message: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class NotificationPreference(Base):
     """Which optional emails a user wants. Security emails (codes, password resets) are always sent."""
 
@@ -168,3 +182,43 @@ class NotificationPreference(Base):
     product_updates: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     billing_emails: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
     last_reminder_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Scenario(Base):
+    """A role-play situation for the game. Managed from the admin API, not in the app code."""
+
+    __tablename__ = "scenarios"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    slug: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(80))
+    description: Mapped[str] = mapped_column(String(240))
+    category: Mapped[str] = mapped_column(String(30), index=True)
+    icon: Mapped[str] = mapped_column(String(40), default="chatbubbles-outline")  # an Ionicons name
+    tint: Mapped[str] = mapped_column(String(9), default="#6366F1")
+    # Instructions for the AI: who it plays and how it behaves (English, the AI answers in German).
+    persona: Mapped[str] = mapped_column(Text)
+    # The first line the other person says, per level: {"beginner": "...", "intermediate": "...", "professional": "..."}
+    openings: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # Phrases worth knowing before starting: [{"de": "...", "en": "..."}]
+    key_phrases: Mapped[list] = mapped_column(JSONB, default=list)
+    sort_order: Mapped[int] = mapped_column(Integer, default=100)
+    published: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ScenarioRequest(Base):
+    """A scenario a user would like to see. An admin reads it and, if it fits, writes the scenario."""
+
+    __tablename__ = "scenario_requests"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(80))
+    description: Mapped[str] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(10), default="pending", server_default="pending")  # pending | approved | rejected
+    admin_note: Mapped[str] = mapped_column(String(300), default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

@@ -274,3 +274,168 @@ class NotificationPrefs(BaseModel):
     practice_reminders: bool
     product_updates: bool
     billing_emails: bool
+
+
+Level = Literal["beginner", "intermediate", "professional"]
+
+
+class KeyPhrase(BaseModel):
+    de: str = Field(max_length=200)
+    en: str = Field(max_length=200)
+
+
+class ScenarioIn(BaseModel):
+    slug: str = Field(min_length=2, max_length=40, pattern=r"^[a-z0-9-]+$")
+    title: str = Field(min_length=2, max_length=80)
+    description: str = Field(min_length=2, max_length=240)
+    category: str = Field(min_length=2, max_length=30)
+    icon: str = Field(default="chatbubbles-outline", max_length=40)
+    tint: str = Field(default="#6366F1", pattern=r"^#[0-9A-Fa-f]{6}$")
+    persona: str = Field(min_length=20, max_length=2000)
+    openings: dict[Level, str]
+    key_phrases: list[KeyPhrase] = Field(default_factory=list, max_length=12)
+    sort_order: int = 100
+    published: bool = False
+
+    @model_validator(mode="after")
+    def _openings_complete(self):
+        missing = [lv for lv in ("beginner", "intermediate", "professional") if not self.openings.get(lv, "").strip()]
+        if missing:
+            raise ValueError(f"an opening line is needed for: {', '.join(missing)}")
+        return self
+
+
+class ScenarioPatch(BaseModel):
+    """Every field optional; only the ones sent change."""
+
+    title: str | None = Field(default=None, min_length=2, max_length=80)
+    description: str | None = Field(default=None, min_length=2, max_length=240)
+    category: str | None = Field(default=None, min_length=2, max_length=30)
+    icon: str | None = Field(default=None, max_length=40)
+    tint: str | None = Field(default=None, pattern=r"^#[0-9A-Fa-f]{6}$")
+    persona: str | None = Field(default=None, min_length=20, max_length=2000)
+    openings: dict[Level, str] | None = None
+    key_phrases: list[KeyPhrase] | None = Field(default=None, max_length=12)
+    sort_order: int | None = None
+    published: bool | None = None
+
+
+class ScenarioOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    slug: str
+    title: str
+    description: str
+    category: str
+    icon: str
+    tint: str
+    persona: str
+    openings: dict[str, str]
+    key_phrases: list[KeyPhrase]
+    sort_order: int
+    published: bool
+
+
+class LevelOut(BaseModel):
+    id: str
+    label: str
+    cefr: str
+    description: str
+    rules: str
+
+
+class ScenarioList(BaseModel):
+    levels: list[LevelOut]
+    scenarios: list[ScenarioOut]
+
+
+class ScenarioRequestIn(BaseModel):
+    title: str = Field(min_length=3, max_length=80)
+    description: str = Field(min_length=10, max_length=500)
+
+
+class ScenarioRequestOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    description: str
+    status: Literal["pending", "approved", "rejected"]
+    admin_note: str
+    created_at: datetime
+
+
+class ScenarioRequestAdminOut(ScenarioRequestOut):
+    user_id: int
+    username: str | None = None
+
+
+class ScenarioRequestReview(BaseModel):
+    status: Literal["pending", "approved", "rejected"]
+    admin_note: str = Field(default="", max_length=300)
+
+
+# ---- Admin: users, tickets, stats ----
+
+
+class AdminUserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    email: str
+    full_name: str | None
+    email_verified: bool
+    is_active: bool
+    is_admin: bool
+    created_at: datetime
+    trial_ends_at: datetime | None
+    plan: str | None = None  # standard | pro while they have access, otherwise null
+
+
+class AdminUserList(BaseModel):
+    total: int
+    users: list[AdminUserOut]
+
+
+class AdminUserDetail(AdminUserOut):
+    billing: dict
+    usage: dict
+    points: int
+    saved_phrases: int
+    tickets: int
+
+
+class AdminUserPatch(BaseModel):
+    is_active: bool | None = None
+    is_admin: bool | None = None
+    email_verified: bool | None = None
+    extend_trial_days: int | None = Field(default=None, ge=1, le=365)
+
+
+class AdminTicketOut(TicketOut):
+    user_id: int
+    username: str | None = None
+    email: str | None = None
+    updated_at: datetime
+
+
+class TicketReplyOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    message: str
+    created_at: datetime
+
+
+class AdminTicketDetail(AdminTicketOut):
+    replies: list[TicketReplyOut]
+
+
+class TicketStatusPatch(BaseModel):
+    status: Literal["open", "closed"]
+
+
+class TicketReplyIn(BaseModel):
+    message: str = Field(min_length=2, max_length=5000)

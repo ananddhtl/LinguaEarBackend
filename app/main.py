@@ -1,14 +1,49 @@
+import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db import get_db
-from app.routers import ai, analyses, auth, billing, diagnostics, notifications, scores, support, users
+from app.db import SessionLocal, get_db
+from app.admin_seed import seed_admin
+from app.scenario_seed import seed_scenarios
+from app.routers import (
+    admin,
+    admin_manage,
+    ai,
+    analyses,
+    auth,
+    billing,
+    diagnostics,
+    notifications,
+    scenarios,
+    scores,
+    support,
+    users,
+)
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # Starter scenarios are added on start-up. A failure here (for example, tables not created yet) must not
+    # stop the server from coming up.
+    try:
+        with SessionLocal() as db:
+            seed_scenarios(db)
+    except Exception:
+        logging.getLogger("uvicorn.error").exception("Could not add the starter scenarios")
+    try:
+        with SessionLocal() as db:
+            seed_admin(db)
+    except Exception:
+        logging.getLogger("uvicorn.error").exception("Could not create the admin account")
+    yield
+
 
 app = FastAPI(
+    lifespan=lifespan,
     title="LinguaEar API",
     version="0.1.0",
     description=(
@@ -19,6 +54,8 @@ app = FastAPI(
     openapi_tags=[
         {"name": "auth", "description": "Register, log in, refresh, verify email, reset password."},
         {"name": "profile", "description": "View and update the signed-in user's profile and password."},
+        {"name": "scenarios", "description": "Game scenarios, conversation levels and scenario requests."},
+        {"name": "admin", "description": "Scenarios, suggestions, users, support tickets and stats (admins only)."},
         {"name": "support", "description": "Help requests (tickets) from users."},
         {"name": "notifications", "description": "Optional email preferences and unsubscribe links."},
         {"name": "billing", "description": "Free trial, plans and Stripe checkout."},
@@ -33,6 +70,9 @@ app.include_router(analyses.router)
 app.include_router(scores.router)
 app.include_router(ai.router)
 app.include_router(diagnostics.router)
+app.include_router(scenarios.router)
+app.include_router(admin.router)
+app.include_router(admin_manage.router)
 app.include_router(billing.router)
 app.include_router(support.router)
 app.include_router(notifications.router)

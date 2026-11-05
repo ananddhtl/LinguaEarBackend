@@ -50,6 +50,14 @@ class Settings(BaseSettings):
     # Set this to a long random value to switch on GET /health/email, which tests the mail connection.
     diagnostics_token: str | None = None
 
+    # Game scenarios
+    max_scenario_requests_per_day: int = 3
+
+    # Admin account created on start-up when both are set (see app/admin_seed.py). Leave unset to create none.
+    admin_email: str | None = None
+    admin_password: str | None = None
+    admin_username: str = "admin"
+
     # Support. Tickets are emailed here; with no address set, the SMTP account's own inbox is used.
     support_email: str | None = None
     max_tickets_per_day: int = 5
