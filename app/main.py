@@ -4,6 +4,7 @@ from fastapi import Depends, FastAPI
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db import get_db
 from app.routers import ai, analyses, auth, billing, diagnostics, notifications, scores, support, users
 
@@ -41,4 +42,11 @@ app.include_router(notifications.router)
 def health(db: Session = Depends(get_db)):
     db.execute(text("SELECT 1"))
     # Render sets RENDER_GIT_COMMIT, so this shows which version of the code is actually running.
-    return {"status": "ok", "commit": os.getenv("RENDER_GIT_COMMIT", "")[:7] or None}
+    return {
+        "status": "ok",
+        "commit": os.getenv("RENDER_GIT_COMMIT", "")[:7] or None,
+        # Temporary setup help: which email method is active, and whether the test token reached the app.
+        # Only yes/no facts and a length; no secret value is ever shown.
+        "email": "brevo-api" if settings.brevo_api_key else ("smtp" if settings.smtp_host else "not configured"),
+        "diagnostics_token_length": len(settings.diagnostics_token) if settings.diagnostics_token else 0,
+    }
