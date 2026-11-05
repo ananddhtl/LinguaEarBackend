@@ -1,3 +1,5 @@
+import os
+
 from fastapi import Depends, FastAPI
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -38,4 +40,5 @@ app.include_router(notifications.router)
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     db.execute(text("SELECT 1"))
-    return {"status": "ok"}
+    # Render sets RENDER_GIT_COMMIT, so this shows which version of the code is actually running.
+    return {"status": "ok", "commit": os.getenv("RENDER_GIT_COMMIT", "")[:7] or None}
